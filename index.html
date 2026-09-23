@@ -277,20 +277,6 @@ function toast(msg) { const t = $("#toast"); t.textContent = msg; t.hidden = fal
 function loadScript(src) { return new Promise((res, rej) => { if (document.querySelector(`script[src="${src}"]`)) return res(); const s = document.createElement("script"); s.src = src; s.onload = res; s.onerror = () => rej(new Error("load")); document.head.appendChild(s); }); }
 
 /* ---------- state ---------- */
-const EXAMPLE = {
-  id: "ejemplo", example: true, comercio: "Supermercado (ejemplo)", fecha: today(), descuentoGeneral: 5000, totalImpreso: 202400,
-  items: [
-    { id: "a", nombre: "Leche entera 1L", cantidad: 4, monto: 28000 },
-    { id: "h", nombre: "Jabón de tocador x3", cantidad: 3, monto: 15000 },
-    { id: "b", nombre: "Pan lactal", cantidad: 1, monto: 14500 },
-    { id: "c", nombre: "Carne molida 1kg", cantidad: 1, monto: 42000 },
-    { id: "d", nombre: "Shampoo reparación", cantidad: 1, monto: 31900 },
-    { id: "e", nombre: "Yerba mate 1kg", cantidad: 1, monto: 22000 },
-    { id: "f", nombre: "Cerveza lata x6", cantidad: 1, monto: 36000 },
-    { id: "g", nombre: "Tomate", cantidad: 1, monto: 18000 }
-  ],
-  assign: { d: "u2", f: "u1", h: { u2: 2, u1: 0 } }, done: { u2: true }, createdAt: 0
-};
 const S = {
   auth: "loading", authError: null,
   facturas: [], names: { u1: "Usuario 1", u2: "Usuario 2" },
@@ -302,7 +288,7 @@ const memStore = {};
 const pendingAssign = {}; // fid -> {itemId: val}
 const writeChain = {};    // fid -> promise
 
-function getF(id) { if (id === "ejemplo") return EXAMPLE; return S.facturas.find(f => f.id === id); }
+function getF(id) { return S.facturas.find(f => f.id === id); }
 function nm(k) { return S.names[k] || (k === "u1" ? "Usuario 1" : "Usuario 2"); }
 function qtyOf(it) { return Math.max(1, toInt(it.cantidad) || 1); }
 function rawAssign(f, id) { const p = pendingAssign[f.id]?.[id]; return p !== undefined ? p : f.assign?.[id]; }
@@ -391,7 +377,6 @@ async function uploadFiles(fid, list) {
   return out;
 }
 async function attachTo(f, list) {
-  if (f.example) { toast("El ejemplo no guarda archivos."); return; }
   if (!list.length) return;
   toast("Subiendo archivos…");
   const nuevos = await uploadFiles(f.id, list);
@@ -410,20 +395,18 @@ async function openFile(a) {
 /* ---------- persistence ---------- */
 function chain(fid, fn) { const p = (writeChain[fid] || Promise.resolve()).then(fn, fn); writeChain[fid] = p.catch(() => {}); return p; }
 async function saveFactura(f) {
-  if (f.example) return;
   const body = JSON.parse(JSON.stringify(f)); delete body.id;
   if (!db) { memStore[f.id] = body; syncMem(); return; }
   try { await chain(f.id, () => db.doc("facturas/" + f.id).set(body)); }
   catch (e) { toast(e?.code === "quota_exceeded" ? "Se llenó el espacio. Borrá facturas viejas." : "No se pudo guardar. Probá de nuevo."); }
 }
 async function patchFactura(fid, patch) {
-  const f = getF(fid); if (!f || f.example) { for (const [k, v] of Object.entries(patch)) EXAMPLE[k] = v && typeof v === "object" && !Array.isArray(v) ? { ...(EXAMPLE[k] || {}), ...v } : v; return; }
+  const f = getF(fid); if (!f) return;
   if (!db) { const m = memStore[fid]; for (const [k, v] of Object.entries(JSON.parse(JSON.stringify(patch)))) m[k] = v && typeof v === "object" && !Array.isArray(v) ? { ...(m[k] || {}), ...v } : v; syncMem(); return; }
   try { await chain(fid, () => db.doc("facturas/" + fid).update(patch)); }
   catch { toast("No se pudo guardar el cambio."); }
 }
 function queueAssign(fid, itemId, val) {
-  if (fid === "ejemplo") { EXAMPLE.assign[itemId] = val; return; }
   (pendingAssign[fid] ||= {})[itemId] = val;
   clearTimeout(queueAssign["t" + fid]);
   queueAssign["t" + fid] = setTimeout(async () => {
@@ -512,7 +495,7 @@ function viewHome() {
   const allXml = S.files.length > 0 && S.files.every(f => f.type === "xml");
   const readOk = !!sample || allXml;
   const files = S.files.map((f, i) => `<div class="thumb">${f.type === "application/pdf" ? "PDF" : f.type === "xml" ? "XML" : `<img src="${f.url}" alt="">`}<button type="button" data-rm="${i}" aria-label="Quitar archivo">×</button></div>`).join("");
-  const hist = [...S.facturas, EXAMPLE].map(histRow).join("");
+  const hist = S.facturas.map(histRow).join("");
   return `
   <section class="hero">
     <h1>Expenses Tronks</h1>
@@ -554,7 +537,7 @@ function viewHome() {
   <section class="section" id="historial">
     <h2>Historial</h2>
     <p class="sub">${db || !S.loaded ? "Facturas guardadas en este link. Las ven los dos." : "En esta vista las facturas no se guardan online."}</p>
-    <div>${hist}</div>
+    <div>${hist || `<p class="muted" style="margin:0">Todavía no hay facturas. Subí la primera arriba.</p>`}</div>
   </section>`;
 }
 
@@ -562,7 +545,7 @@ function histRow(f) {
   const c = calc(f), d = f.done || {};
   return `<button type="button" class="hrow" data-open="${esc(f.id)}">
     <div><div class="k">${esc(fmtDate(f.fecha))} · ${(f.items || []).length} productos</div>
-      <div class="v">${esc(f.comercio || "Factura")}${f.example ? `<span class="tag">Ejemplo</span>` : ""} · <span class="num">${gs(c.total)}</span></div></div>
+      <div class="v">${esc(f.comercio || "Factura")} · <span class="num">${gs(c.total)}</span></div></div>
     <div class="who"><span><span class="dot ${d.u2 ? "u2" : "off"}"></span>${esc(nm("u2"))} ${d.u2 ? "listo" : "pendiente"}</span><span><span class="dot ${d.u1 ? "u1" : "off"}"></span>${esc(nm("u1"))} ${d.u1 ? "listo" : "pendiente"}</span></div>
     <span class="btn sm" aria-hidden="true">Abrir</span>
   </button>`;
@@ -619,7 +602,7 @@ function viewFactura(f) {
   return `
   <div class="split">
     <section class="left">
-      <div class="eyebrow">${esc(fmtDate(f.fecha))}${f.example ? " · ejemplo, no se guarda" : ""}</div>
+      <div class="eyebrow">${esc(fmtDate(f.fecha))}</div>
       <h1>${esc(f.comercio || "Factura")}</h1>
       <div class="marking">
         <span class="l">Estoy marcando como</span>
@@ -673,17 +656,17 @@ function viewFactura(f) {
         </div>
       </div>
 
-      ${f.example ? "" : `<div>
+      <div>
         <h3 style="font-family:var(--sans);font-size:18px;font-weight:500;letter-spacing:0;margin-bottom:12px">Archivos</h3>
         <div class="files">
           ${(f.archivos || []).map((a, i) => `<button type="button" class="filerow" data-file="${i}"><span class="ft">${esc(a.tipo || "")}</span><span class="fn">${esc(a.nombre)}</span></button>`).join("") || `<p class="muted" style="margin:0;font-size:14px">Todavía no hay archivos en esta factura.</p>`}
           <div><button class="btn sm" type="button" id="attachBtn">+ Adjuntar archivo</button></div>
         </div>
-      </div>`}
+      </div>
 
       <div class="actions" style="margin-top:0">
         <button class="btn" type="button" id="copyBtn">Copiar resumen</button>
-        ${f.example ? "" : `<button class="btn danger" type="button" id="delBtn">${S.confirmDel ? "Tocá de nuevo para borrar" : "Borrar factura"}</button>`}
+        <button class="btn danger" type="button" id="delBtn">${S.confirmDel ? "Tocá de nuevo para borrar" : "Borrar factura"}</button>
       </div>
     </aside>
   </div>`;
