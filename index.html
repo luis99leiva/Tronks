@@ -225,6 +225,13 @@ h1,h2,h3{font-family:var(--serif);font-weight:400;letter-spacing:-.01em;margin:0
 .chips{display:flex;gap:10px;flex-wrap:wrap}
 .chip{border:1px solid var(--ink);border-radius:14px;padding:10px 20px;background:var(--paper);font-size:15.5px}
 
+.login{max-width:440px;margin:0 auto;display:flex;flex-direction:column;gap:18px}
+.login .btn{width:100%}
+.files{display:flex;flex-direction:column;gap:8px}
+.filerow{display:flex;align-items:center;gap:10px;width:100%;text-align:left;border:1px solid var(--line);border-radius:14px;padding:10px 14px;background:var(--paper);font-size:14.5px}
+.filerow:hover{background:var(--soft)}
+.filerow .fn{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.filerow .ft{font-size:11px;font-weight:600;color:var(--muted);border:1px solid var(--line);border-radius:6px;padding:1px 6px}
 .toast{position:fixed;left:50%;transform:translateX(-50%);bottom:96px;background:var(--ink);color:var(--bg);padding:10px 18px;border-radius:12px;font-size:14px;z-index:30}
 </style>
 
@@ -239,6 +246,7 @@ h1,h2,h3{font-family:var(--serif);font-weight:400;letter-spacing:-.01em;margin:0
     </nav>
     <div class="tools">
       <button class="pill brand" type="button" data-go="upload">Subir factura</button>
+      <button class="pill" type="button" id="logoutBtn" hidden>Salir</button>
       <button class="pill icon" type="button" id="themeBtn" aria-label="Cambiar tema"></button>
     </div>
   </div>
@@ -248,6 +256,7 @@ h1,h2,h3{font-family:var(--serif);font-weight:400;letter-spacing:-.01em;margin:0
 <div class="scrim" id="drawer" hidden></div>
 <div class="toast" id="toast" hidden></div>
 <input id="file" type="file" accept="image/jpeg,image/png,image/webp,image/gif,application/pdf,.xml,text/xml,application/xml" multiple hidden>
+<input id="attach" type="file" accept="image/jpeg,image/png,image/webp,image/gif,application/pdf,.xml,text/xml,application/xml" multiple hidden>
 
 <script>
 (() => {
@@ -283,6 +292,7 @@ const EXAMPLE = {
   assign: { d: "u2", f: "u1", h: { u2: 2, u1: 0 } }, done: { u2: true }, createdAt: 0
 };
 const S = {
+  auth: "loading", authError: null,
   facturas: [], names: { u1: "Usuario 1", u2: "Usuario 2" },
   me: lsGet("sam-me", "u2"), view: "home", cur: null, filter: "all", editing: null,
   files: [], busy: null, error: null, confirmDel: false, loaded: false, big: "t", draft: null, open: null
@@ -319,6 +329,84 @@ function setMine(f, it, n) {
   queueAssign(f.id, it.id, val);
 }
 
+/* ---------- Supabase ---------- */
+const SB_URL = "https://lmybfodkrqbngwqamebj.supabase.co";
+const SB_KEY = "sb_publishable_hdRsfHsgjAzAZgs-vX_Yjg_TVN7zsAW";
+const SBJS = "https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.min.js";
+const BUCKET = "archivos", MAX_FILE = 10 * 1024 * 1024;
+let sb = null;
+
+function makeDb(sb) {
+  const where = p => { const [col, id] = p.split("/"); return { t: col === "facturas" ? "facturas" : "config", id }; };
+  const merge = (cur, patch) => { const m = { ...cur }; for (const [k, v] of Object.entries(patch)) m[k] = v && typeof v === "object" && !Array.isArray(v) ? { ...(m[k] || {}), ...v } : v; return m; };
+  const chk = r => { if (r.error) throw r.error; return r; };
+  const listeners = { facturas: new Set(), config: new Set() };
+  const fire = t => listeners[t].forEach(fn => fn());
+  sb.channel("tronks-cambios")
+    .on("postgres_changes", { event: "*", schema: "public", table: "facturas" }, () => fire("facturas"))
+    .on("postgres_changes", { event: "*", schema: "public", table: "config" }, () => fire("config"))
+    .subscribe();
+  addEventListener("focus", () => { fire("facturas"); fire("config"); });
+  return {
+    doc(path) {
+      const { t, id } = where(path);
+      return {
+        async set(body) { chk(await sb.from(t).upsert({ id, data: body })); fire(t); },
+        async update(patch) {
+          const { data } = chk(await sb.from(t).select("data").eq("id", id).maybeSingle());
+          chk(await sb.from(t).upsert({ id, data: merge(data?.data || {}, JSON.parse(JSON.stringify(patch))) }));
+          fire(t);
+        },
+        async delete() { chk(await sb.from(t).delete().eq("id", id)); fire(t); },
+        onSnapshot(cb, err) {
+          const run = async () => { const { data, error } = await sb.from(t).select("data").eq("id", id).maybeSingle(); if (error) return err?.(error); cb({ exists: !!data, data: () => data?.data }); };
+          listeners[t].add(run); run();
+        }
+      };
+    },
+    collection(name) {
+      return {
+        onSnapshot(cb, err) {
+          const run = async () => { const { data, error } = await sb.from(name).select("id,data"); if (error) return err?.(error); cb({ docs: data.map(r => ({ id: r.id, data: () => r.data })) }); };
+          listeners[name].add(run); run();
+        }
+      };
+    }
+  };
+}
+
+async function uploadFiles(fid, list) {
+  if (!sb || S.auth !== "in" || !list.length) return [];
+  const out = [];
+  for (const x of list) {
+    const file = x.file || x;
+    if (file.size > MAX_FILE) { toast(`"${file.name}" pesa más de 10 MB y no se guardó.`); continue; }
+    const isXml = /xml/.test(file.type) || /\.xml$/i.test(file.name);
+    const safe = file.name.normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/[^\w.\-]+/g, "_").slice(-80);
+    const path = `${fid}/${Date.now()}-${Math.random().toString(36).slice(2, 6)}-${safe}`;
+    const { error } = await sb.storage.from(BUCKET).upload(path, file, { contentType: file.type || (isXml ? "application/xml" : "application/octet-stream") });
+    if (error) { toast(`No se pudo guardar "${file.name}".`); continue; }
+    out.push({ path, nombre: file.name, tipo: isXml ? "XML" : file.type === "application/pdf" ? "PDF" : "IMG", tam: file.size });
+  }
+  return out;
+}
+async function attachTo(f, list) {
+  if (f.example) { toast("El ejemplo no guarda archivos."); return; }
+  if (!list.length) return;
+  toast("Subiendo archivos…");
+  const nuevos = await uploadFiles(f.id, list);
+  if (!nuevos.length) return;
+  f.archivos = [...(f.archivos || []), ...nuevos]; render();
+  await patchFactura(f.id, { archivos: f.archivos });
+  toast(nuevos.length > 1 ? "Archivos guardados" : "Archivo guardado");
+}
+async function openFile(a) {
+  const w = window.open("", "_blank");
+  const { data, error } = await sb.storage.from(BUCKET).createSignedUrl(a.path, 300);
+  if (error || !data?.signedUrl) { w?.close(); toast("No se pudo abrir el archivo."); return; }
+  if (w) w.location = data.signedUrl; else location.href = data.signedUrl;
+}
+
 /* ---------- persistence ---------- */
 function chain(fid, fn) { const p = (writeChain[fid] || Promise.resolve()).then(fn, fn); writeChain[fid] = p.catch(() => {}); return p; }
 async function saveFactura(f) {
@@ -345,7 +433,8 @@ function queueAssign(fid, itemId, val) {
     if (pendingAssign[fid] === batch) delete pendingAssign[fid];
   }, 450);
 }
-async function deleteFactura(fid) {
+async function deleteFactura(fid, paths = []) {
+  if (sb && paths.length) { try { await sb.storage.from(BUCKET).remove(paths); } catch {} }
   if (!db) { delete memStore[fid]; syncMem(); return; }
   try { await db.doc("facturas/" + fid).delete(); } catch { toast("No se pudo borrar."); }
 }
@@ -400,9 +489,23 @@ const ICON = {
 /* ---------- views ---------- */
 function render() {
   const v = $("#view");
+  const inApp = S.auth === "in";
+  document.querySelector(".tools .brand").hidden = !inApp; document.querySelector(".links").style.visibility = inApp ? "" : "hidden"; $("#logoutBtn").hidden = !inApp;
+  if (!inApp) { v.innerHTML = viewLogin(); $("#mbar").classList.remove("on"); return; }
   if (S.view === "factura" && getF(S.cur)) v.innerHTML = viewFactura(getF(S.cur));
   else { S.view = "home"; v.innerHTML = viewHome(); }
   renderMbar();
+}
+
+function viewLogin() {
+  if (S.auth === "loading") return `<section class="hero"><div class="progress" style="justify-content:center"><span class="spin"></span>Cargando…</div></section>`;
+  return `<section class="hero"><h1>Entrar</h1><p>Solo para los tronks. Usá tu email y tu contraseña.</p></section>
+  <form id="loginForm" class="login">
+    <div class="field"><label for="lg-email">Email</label><input class="input" id="lg-email" type="email" autocomplete="email" required></div>
+    <div class="field"><label for="lg-pass">Contraseña</label><input class="input" id="lg-pass" type="password" autocomplete="current-password" required></div>
+    ${S.authError ? `<div class="err" style="margin:0">${esc(S.authError)}</div>` : ""}
+    <button class="btn save" type="submit" id="lg-btn">Entrar</button>
+  </form>`;
 }
 
 function viewHome() {
@@ -446,7 +549,7 @@ function viewHome() {
       ${S.busy ? `<div class="progress"><span class="spin"></span>${esc(S.busy)}</div><button class="btn sm" type="button" id="stopBtn">Cancelar</button>`
                : `<button class="btn brand" type="button" id="readBtn" ${!readOk ? "disabled" : ""}>${allXml ? "Leer factura" : "Leer factura con IA"}</button><span class="muted" style="font-size:14px">${allXml ? "El XML se lee al instante." : "Tarda entre 10 segundos y un minuto."}</span>`}
     </div>` : ""}
-  ${!readOk && S.loaded && S.files.length ? `<div class="err">La lectura con IA no está disponible en esta vista. Usá "Cargar a mano".</div>` : ""}
+  ${!readOk && S.loaded && S.files.length ? `<div class="err">La lectura con IA no está disponible acá. Tocá "Cargar a mano": los archivos quedan guardados en la factura y escribís los productos.</div>` : ""}
 
   <section class="section" id="historial">
     <h2>Historial</h2>
@@ -569,6 +672,14 @@ function viewFactura(f) {
           ${foot}
         </div>
       </div>
+
+      ${f.example ? "" : `<div>
+        <h3 style="font-family:var(--sans);font-size:18px;font-weight:500;letter-spacing:0;margin-bottom:12px">Archivos</h3>
+        <div class="files">
+          ${(f.archivos || []).map((a, i) => `<button type="button" class="filerow" data-file="${i}"><span class="ft">${esc(a.tipo || "")}</span><span class="fn">${esc(a.nombre)}</span></button>`).join("") || `<p class="muted" style="margin:0;font-size:14px">Todavía no hay archivos en esta factura.</p>`}
+          <div><button class="btn sm" type="button" id="attachBtn">+ Adjuntar archivo</button></div>
+        </div>
+      </div>`}
 
       <div class="actions" style="margin-top:0">
         <button class="btn" type="button" id="copyBtn">Copiar resumen</button>
@@ -779,10 +890,12 @@ async function readInvoice() {
       assign: {}, done: {}
     };
     S.facturas.unshift(f);
+    const toUp = S.files.slice();
     S.files.forEach(x => x.url && URL.revokeObjectURL(x.url)); S.files = [];
     S.busy = null; S.view = "factura"; S.cur = f.id; S.filter = "all";
     render(); window.scrollTo(0, 0);
     await saveFactura(f);
+    await attachTo(f, toUp);
   } catch (e) {
     S.busy = null;
     const m = {
@@ -827,13 +940,16 @@ document.addEventListener("click", async e => {
   if (t.dataset.rm !== undefined) { e.stopPropagation(); const [x] = S.files.splice(+t.dataset.rm, 1); x?.url && URL.revokeObjectURL(x.url); render(); return; }
   if (t.dataset.go) { if (t.dataset.go === "upload" && S.view === "home") { $("#file").click(); return; } return go(t.dataset.go); }
   if (t.id === "themeBtn") { const next = isDark() ? "light" : "dark"; document.documentElement.dataset.theme = next; lsSet("sam-theme", next); paintThemeBtn(); return; }
+  if (t.id === "logoutBtn") { try { await sb?.auth.signOut(); } catch {} location.reload(); return; }
   if (t.dataset.close !== undefined) return closeDrawer();
   if (t.id === "readBtn") return readInvoice();
   if (t.id === "stopBtn") { ctl?.abort(); S.busy = null; render(); return; }
   if (t.id === "manualBtn") {
     const f = { id: uid(), createdAt: Date.now(), comercio: "Súper", fecha: today(), items: [], descuentoGeneral: 0, totalImpreso: null, assign: {}, done: {} };
     S.facturas.unshift(f); await saveFactura(f);
-    S.view = "factura"; S.cur = f.id; S.filter = "all"; render(); window.scrollTo(0, 0); openEdit(f); return;
+    const toUp = S.files.slice(); S.files.forEach(x => x.url && URL.revokeObjectURL(x.url)); S.files = []; S.error = null;
+    S.view = "factura"; S.cur = f.id; S.filter = "all"; render(); window.scrollTo(0, 0); openEdit(f);
+    attachTo(f, toUp); return;
   }
   if (t.dataset.open) { S.view = "factura"; S.cur = t.dataset.open; S.filter = "all"; S.big = "t"; S.confirmDel = false; render(); window.scrollTo(0, 0); return; }
   if (t.id === "addItem") { collectDraft(); S.draft.items.push({ id: uid(), nombre: "", cantidad: 1, monto: "" }); drawEdit(); const all = document.querySelectorAll('[data-e="nombre"]'); all[all.length - 1]?.focus(); return; }
@@ -874,6 +990,8 @@ document.addEventListener("click", async e => {
     return;
   }
   if (t.id === "editBtn") return openEdit(f);
+  if (t.id === "attachBtn") { $("#attach").click(); return; }
+  if (t.dataset.file !== undefined) { const a = (f.archivos || [])[+t.dataset.file]; if (a) openFile(a); return; }
   if (t.id === "copyBtn") {
     const c = calc(f);
     const txt = `${f.comercio || "Súper"} · ${fmtDate(f.fecha)}\nTotal: ${gs(c.total)}\n\n${nm("u1")}: ${gs(c.p1)} (propio ${gs(c.net.u1)} + mitad ${gs(c.net.s / 2)})\n${nm("u2")}: ${gs(c.p2)} (propio ${gs(c.net.u2)} + mitad ${gs(c.net.s / 2)})`;
@@ -884,15 +1002,23 @@ document.addEventListener("click", async e => {
   if (t.id === "delBtn") {
     if (!S.confirmDel) { S.confirmDel = true; render(); setTimeout(() => { if (S.confirmDel) { S.confirmDel = false; render(); } }, 4000); return; }
     S.confirmDel = false; S.facturas = S.facturas.filter(x => x.id !== f.id); S.view = "home"; render();
-    await deleteFactura(f.id); toast("Factura borrada"); return;
+    await deleteFactura(f.id, (f.archivos || []).map(a => a.path)); toast("Factura borrada"); return;
   }
 });
 document.addEventListener("keydown", e => {
   if (e.key === "Escape" && !$("#drawer").hidden) closeDrawer();
   if ((e.key === "Enter" || e.key === " ") && e.target.id === "drop") { e.preventDefault(); $("#file").click(); }
 });
+document.addEventListener("change", e => { if (e.target.id === "attach") { const f = getF(S.cur); const list = [...e.target.files]; e.target.value = ""; if (f) attachTo(f, list); return; } });
 document.addEventListener("change", e => { if (e.target.id === "file") { S.error = null; addFiles(e.target.files); e.target.value = ""; if (S.view !== "home") { S.view = "home"; render(); } } });
 document.addEventListener("submit", async e => {
+  if (e.target.id === "loginForm") {
+    e.preventDefault();
+    const btn = $("#lg-btn"); btn.disabled = true; btn.textContent = "Entrando…";
+    const { error } = await sb.auth.signInWithPassword({ email: $("#lg-email").value.trim(), password: $("#lg-pass").value });
+    if (error) { S.authError = /invalid/i.test(error.message) ? "Email o contraseña incorrectos." : "No se pudo entrar. Probá de nuevo."; render(); return; }
+    S.authError = null; startApp(); return;
+  }
   if (e.target.id !== "namesForm") return;
   e.preventDefault();
   const n = { u1: $("#nm1").value.trim() || "Usuario 1", u2: $("#nm2").value.trim() || "Usuario 2" };
@@ -908,23 +1034,31 @@ document.addEventListener("drop", e => { const d = e.target.closest?.("#drop"); 
 paintThemeBtn();
 try { matchMedia("(prefers-color-scheme: dark)").addEventListener("change", paintThemeBtn); } catch {}
 render();
-(async () => {
-  const c = window.claude;
-  const [dbNs, sNs] = await Promise.all([c?.use ? c.use("db").catch(() => null) : null, c?.use ? c.use("sample").catch(() => null) : null]);
-  db = dbNs; sample = sNs;
-  if (sample) limits = await sample.limits().catch(() => null);
-  S.loaded = true;
-  if (db) {
-    db.collection("facturas").onSnapshot(snap => {
-      S.facturas = snap.docs.map(d => ({ id: d.id, ...JSON.parse(JSON.stringify(d.data())) })).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
-      render();
-    }, () => { db = null; render(); });
-    db.doc("config/general").onSnapshot(snap => {
-      const n = snap.exists ? snap.data()?.names : null;
-      if (n) { S.names = { u1: n.u1 || "Usuario 1", u2: n.u2 || "Usuario 2" }; render(); }
-    }, () => {});
-  }
+let started = false;
+function startApp() {
+  if (started) { S.auth = "in"; render(); return; }
+  started = true;
+  S.auth = "in"; S.loaded = true;
+  db = makeDb(sb);
+  db.collection("facturas").onSnapshot(snap => {
+    S.facturas = snap.docs.map(d => ({ id: d.id, ...JSON.parse(JSON.stringify(d.data())) })).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+    render();
+  }, () => toast("No se pudieron cargar las facturas."));
+  db.doc("config/general").onSnapshot(snap => {
+    const n = snap.exists ? snap.data()?.names : null;
+    if (n) { S.names = { u1: n.u1 || "Usuario 1", u2: n.u2 || "Usuario 2" }; render(); }
+  }, () => {});
   render();
+}
+(async () => {
+  try {
+    await loadScript(SBJS);
+    sb = window.supabase.createClient(SB_URL, SB_KEY);
+    const { data } = await sb.auth.getSession();
+    if (data?.session) startApp(); else { S.auth = "out"; render(); }
+  } catch {
+    S.auth = "out"; S.authError = "No se pudo conectar con el servidor. Revisá tu internet y recargá la página."; render();
+  }
 })();
 })();
 </script>
